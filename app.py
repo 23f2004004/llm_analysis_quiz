@@ -203,3 +203,118 @@ RULESET:
         llm = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
+            temperature=0
+        )
+
+        reply = llm.choices[0].message.content
+        print(f"[Solver] LLM reply preview: {reply[:500]}", flush=True)
+
+        match = re.search(r"\{.*\}", reply, flags=re.DOTALL)
+        if not match:
+            raise ValueError("JSON not found in model output")
+
+        result = json.loads(match.group(0))
+
+        if not result.get("answer"):
+            raise ValueError("Model returned empty answer")
+
+        return result
+
+    except Exception as exc:
+        print(f"[Solver] Crash: {exc}", flush=True)
+        try: driver.quit()
+        except: pass
+        raise
+
+
+# ---------------------------------------------------
+# SUBMISSION + WORKFLOW
+# ---------------------------------------------------
+
+def send_result(endpoint, email, secret, origin, answer):
+    if endpoint.startswith("/"):
+        base = urlparse(origin)
+        endpoint = f"{base.scheme}://{base.netloc}{endpoint}"
+
+    payload = {
+        "email": email,
+        "secret": secret,
+        "url": origin,
+        "answer": answer
+    }
+
+    print(f"[Submit] → {endpoint}", flush=True)
+    res = requests.post(endpoint, json=payload, timeout=30)
+    return res.json()
+
+
+def run_quiz_chain(start, email, secret):
+    print("[Runner] Starting quiz session", flush=True)
+
+    current = start
+    round_no = 0
+
+    while current and round_no < 15:
+        round_no += 1
+        print(f"\n[Round {round_no}] {current}", flush=True)
+
+        try:
+            outcome = handle_quiz(current)
+            sub_url = outcome["submit_url"]
+            ans = outcome["answer"]
+
+            feedback = send_result(sub_url, email, secret, current, ans)
+            print(f"[Runner] Response: {feedback}", flush=True)
+
+            current = feedback.get("url")
+
+            if feedback.get("delay"):
+                time.sleep(feedback["delay"])
+
+        except Exception as exc:
+            print(f"[Runner] Error: {exc}", flush=True)
+            break
+
+    print("[Runner] Completed session", flush=True)
+
+
+# ---------------------------------------------------
+# FLASK ROUTES
+# ---------------------------------------------------
+
+@app.route("/quiz", methods=["POST"])
+def quiz():
+    print("[API] POST /quiz", flush=True)
+    try:
+        body = request.get_json()
+        if not body:
+            return jsonify({"error": "Invalid JSON"}), 400
+
+        email = body.get("email")
+        secret = body.get("secret")
+        url = body.get("url")
+
+        if not (email and secret and url):
+            return jsonify({"error": "Missing fields"}), 400
+
+        if secret != os.getenv("SECRET"):
+            return jsonify({"error": "Unauthorized"}), 403
+
+        thread = threading.Thread(target=run_quiz_chain, args=(url, email, secret))
+        thread.start()
+
+        return jsonify({"status": "accepted"}), 200
+
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"}), 200
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 10000))
+    print(f">> Server active on port {port}", flush=True)
+    app.run(host="0.0.0.0", port=port)
